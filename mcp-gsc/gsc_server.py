@@ -49,6 +49,34 @@ DEFAULT_SEARCH_ANALYTICS_ROWS = 20
 URL_IN_QUERY_PATTERN = re.compile(r"https?://[^\s>]+", re.IGNORECASE)
 
 
+def _current_timestamp() -> str:
+    """Return a UTC timestamp formatted for connector payloads."""
+
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _build_connector_result(
+    payload: Dict[str, Any],
+    *,
+    title: str,
+    url: str,
+    snippet: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    score: float = 1.0,
+) -> Dict[str, Any]:
+    """Normalize search results to the structure ChatGPT connectors expect."""
+
+    return {
+        "id": _encode_result_id(payload),
+        "title": title,
+        "snippet": snippet,
+        "url": url,
+        "score": score,
+        "timestamp": _current_timestamp(),
+        "metadata": metadata or payload,
+    }
+
+
 def _encode_result_id(payload: Dict[str, Any]) -> str:
     """Encode a payload dictionary into a compact, URL-safe identifier."""
 
@@ -627,24 +655,36 @@ def get_gsc_service():
                 continue  # Try the next path if this one fails
     
     # If we get here, none of the authentication methods worked
-@@ -90,61 +651,51 @@ def get_gsc_service_oauth():
+    raise FileNotFoundError(
+        "No valid Google Search Console credentials found. "
+        "Provide a service account JSON via GSC_CREDENTIALS_PATH or place it next to gsc_server.py, "
+        "or configure OAuth credentials."
+    )
+
+
+def get_gsc_service_oauth():
+    """Authenticate via OAuth user credentials."""
+
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            # Check if client secrets file exists
             if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
                 raise FileNotFoundError(
-                    f"OAuth client secrets file not found. Please place a client_secrets.json file in the script directory "
-                    f"or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
+                    "OAuth client secrets file not found. Provide client_secrets.json or set "
+                    "GSC_OAUTH_CLIENT_SECRETS_FILE."
                 )
-            
-            # Start OAuth flow
+
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-            
-            # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
-    
-    # Build and return the service
+
+        with open(TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
+
     return build("searchconsole", "v1", credentials=creds)
 
 @mcp.tool()
@@ -679,19 +719,37 @@ async def list_properties() -> str:
         return f"Error retrieving properties: {str(e)}"
 
 @mcp.tool()
-@@ -242,101 +793,65 @@ async def delete_site(site_url: str) -> str:
-        elif error_code == 401:
-            return f"Error: Unauthorized. Please check your credentials."
-        elif error_code == 429:
-            return f"Error: Too many requests. Please try again later."
-        elif error_code == 500:
-            return f"Error: Internal server error from Google Search Console API. Please try again later."
-        elif error_code == 503:
-            return f"Error: Service unavailable. Google Search Console API is currently down. Please try again later."
-        else:
-            return f"Error removing site (HTTP {error_code}): {error_message}"
-    except Exception as e:
-        return f"Error removing site: {str(e)}"
+async def delete_site(site_url: str) -> str:
+    """
+    Remove a Search Console property that the authenticated identity has access to.
+    """
+
+    try:
+        service = get_gsc_service()
+        service.sites().delete(siteUrl=site_url).execute()
+        return f"Successfully removed {site_url}."
+    except HttpError as error:
+        error_code = getattr(error.resp, "status", None)
+        error_message = getattr(error, "_get_reason", lambda: str(error))()
+
+        if error_code == 400:
+            return f"Error: Bad request for property {site_url}."
+        if error_code == 401:
+            return "Error: Unauthorized. Please refresh or re-run authentication."
+        if error_code == 403:
+            return "Error: Forbidden. You do not have rights to delete this property."
+        if error_code == 404:
+            return f"Error: Property {site_url} not found."
+        if error_code == 429:
+            return "Error: Too many requests. Please try again later."
+        if error_code == 500:
+            return "Error: Search Console API internal error."
+        if error_code == 503:
+            return "Error: Service unavailable. Try again shortly."
+
+        return f"Error removing site (HTTP {error_code}): {error_message}"
+    except Exception as exc:
+        return f"Error removing site: {exc}"
 
 @mcp.tool()
 async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query") -> str:
@@ -733,34 +791,32 @@ async def get_site_details(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Get site details
         site_info = service.sites().get(siteUrl=site_url).execute()
-        
-        # Format the results
-        result_lines = [f"Site details for {site_url}:"]
-        result_lines.append("-" * 50)
-        
-        # Add basic info
-        result_lines.append(f"Permission level: {site_info.get('permissionLevel', 'Unknown')}")
-        
-        # Add verification info if available
-@@ -350,217 +865,74 @@ async def get_site_details(site_url: str) -> str:
-            if "verificationMethod" in verify_info:
-                result_lines.append(f"Verification method: {verify_info['verificationMethod']}")
-        
-        # Add ownership info if available
-        if "ownershipInfo" in site_info:
-            owner_info = site_info["ownershipInfo"]
-            result_lines.append("\nOwnership Information:")
-            result_lines.append(f"Owner: {owner_info.get('owner', 'Unknown')}")
-            
-            if "verificationMethod" in owner_info:
-                result_lines.append(f"Ownership verification: {owner_info['verificationMethod']}")
-        
-        return "\n".join(result_lines)
-    except Exception as e:
-        return f"Error retrieving site details: {str(e)}"
+
+        lines = [f"Site details for {site_url}", "-" * 50]
+        lines.append(f"Permission level: {site_info.get('permissionLevel', 'Unknown')}")
+
+        verification = site_info.get("siteVerificationInfo") or {}
+        if verification:
+            lines.append("Verification:")
+            if verification.get("verificationState"):
+                lines.append(f"- State: {verification['verificationState']}")
+            if verification.get("verifiedUser"):
+                lines.append(f"- Verified user: {verification['verifiedUser']}")
+            if verification.get("verificationMethod"):
+                lines.append(f"- Method: {verification['verificationMethod']}")
+
+        ownership = site_info.get("ownershipInfo") or {}
+        if ownership:
+            lines.append("Ownership:")
+            if ownership.get("owner"):
+                lines.append(f"- Owner: {ownership['owner']}")
+            if ownership.get("verificationMethod"):
+                lines.append(f"- Verification: {ownership['verificationMethod']}")
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error retrieving site details: {exc}"
 
 @mcp.tool()
 async def get_sitemaps(site_url: str) -> str:
@@ -816,34 +872,28 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
             return "No URLs provided for inspection."
         
         if len(url_list) > 10:
-            return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
-        # Process each URL
-@@ -1385,50 +1757,360 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
-    """
-    try:
-        # Validate inputs
-        action = action.lower().strip()
-        valid_actions = ["list", "details", "submit", "delete"]
-        
-        if action not in valid_actions:
-            return f"Invalid action: {action}. Please use one of: {', '.join(valid_actions)}"
-        
-        if action in ["details", "submit", "delete"] and not sitemap_url:
-            return f"The {action} action requires a sitemap_url parameter."
-        
-        # Perform the requested action
-        if action == "list":
-            return await list_sitemaps_enhanced(site_url, sitemap_index)
-        elif action == "details":
-            return await get_sitemap_details(site_url, sitemap_url)
-        elif action == "submit":
-            return await submit_sitemap(site_url, sitemap_url)
-        elif action == "delete":
-            return await delete_sitemap(site_url, sitemap_url)
-    
-    except Exception as e:
-        return f"Error managing sitemaps: {str(e)}"
+            return (
+                f"Too many URLs provided ({len(url_list)}). "
+                "Please limit to 10 URLs per batch to avoid API quota issues."
+            )
+
+        # Process each URL and collect summaries
+        summaries: List[str] = []
+        for page_url in url_list:
+            try:
+                data = _get_url_inspection_data(site_url, page_url, service=service)
+                summaries.append(_format_url_inspection_text(data))
+            except HttpError as error:
+                status = getattr(error.resp, "status", "unknown")
+                reason = getattr(error, "_get_reason", lambda: str(error))()
+                summaries.append(
+                    f"{page_url}: inspection failed (HTTP {status}) – {reason}"
+                )
+
+        return "\n\n".join(summaries)
+
+    except Exception as exc:
+        return f"Error inspecting URLs: {exc}"
 
 @mcp.tool(name="search")
 async def connector_search(query: str) -> Dict[str, Any]:
@@ -866,20 +916,25 @@ async def connector_search(query: str) -> Dict[str, Any]:
 
     intent = _classify_query_intent(query)
     site_label = _property_label(site_url)
-    results: List[Dict[str, str]] = []
+    results: List[Dict[str, Any]] = []
 
     if intent == "properties":
         for prop in properties:
             site = prop.get("siteUrl")
             if not site:
                 continue
+            permission = prop.get("permissionLevel", "UNKNOWN")
             payload = {"type": "property", "siteUrl": site}
+            snippet = f"Property access level: {permission}. Use fetch to see verification info."
+            metadata = {"siteUrl": site, "permissionLevel": permission}
             results.append(
-                {
-                    "id": _encode_result_id(payload),
-                    "title": f"Search Console property {site}",
-                    "url": _console_url(site, "overview"),
-                }
+                _build_connector_result(
+                    payload,
+                    title=f"Search Console property {site}",
+                    url=_console_url(site, "overview"),
+                    snippet=snippet,
+                    metadata=metadata,
+                )
             )
         return {"results": results}
 
@@ -894,21 +949,36 @@ async def connector_search(query: str) -> Dict[str, Any]:
                 "siteUrl": site_url,
                 "path": matched.get("path"),
             }
+            status = _summarize_sitemap_entry(matched)
+            snippet = (
+                f"{status}. Last downloaded {matched.get('lastDownloaded', 'never')}."
+            )
+            metadata = {
+                "siteUrl": site_url,
+                "path": matched.get("path"),
+                "status": status,
+                "indexedUrls": matched.get("indexedUrls"),
+            }
             results.append(
-                {
-                    "id": _encode_result_id(payload),
-                    "title": f"Sitemap {matched.get('path')} – {_summarize_sitemap_entry(matched)}",
-                    "url": _console_url(site_url, "sitemaps"),
-                }
+                _build_connector_result(
+                    payload,
+                    title=f"Sitemap {matched.get('path')}",
+                    url=_console_url(site_url, "sitemaps"),
+                    snippet=snippet,
+                    metadata=metadata,
+                )
             )
         else:
             overview_payload = {"type": "sitemaps_overview", "siteUrl": site_url}
+            snippet = f"{len(entries)} sitemap files discovered for {site_label}."
             results.append(
-                {
-                    "id": _encode_result_id(overview_payload),
-                    "title": f"Sitemaps overview for {site_label}",
-                    "url": _console_url(site_url, "sitemaps"),
-                }
+                _build_connector_result(
+                    overview_payload,
+                    title=f"Sitemaps overview for {site_label}",
+                    url=_console_url(site_url, "sitemaps"),
+                    snippet=snippet,
+                    metadata={"siteUrl": site_url, "sitemapCount": len(entries)},
+                )
             )
             for entry in entries[:3]:
                 payload = {
@@ -916,12 +986,23 @@ async def connector_search(query: str) -> Dict[str, Any]:
                     "siteUrl": site_url,
                     "path": entry.get("path"),
                 }
+                status = _summarize_sitemap_entry(entry)
+                snippet = (
+                    f"{status}. Last downloaded {entry.get('lastDownloaded', 'never')}."
+                )
                 results.append(
-                    {
-                        "id": _encode_result_id(payload),
-                        "title": f"Sitemap {entry.get('path')} – {_summarize_sitemap_entry(entry)}",
-                        "url": _console_url(site_url, "sitemaps"),
-                    }
+                    _build_connector_result(
+                        payload,
+                        title=f"Sitemap {entry.get('path')}",
+                        url=_console_url(site_url, "sitemaps"),
+                        snippet=snippet,
+                        metadata={
+                            "siteUrl": site_url,
+                            "path": entry.get("path"),
+                            "status": status,
+                            "indexedUrls": entry.get("indexedUrls"),
+                        },
+                    )
                 )
 
         return {"results": results}
@@ -934,6 +1015,8 @@ async def connector_search(query: str) -> Dict[str, Any]:
         site_for_page = _detect_site_for_page_url(page_url, properties) or site_url
 
         title = f"Index inspection for {page_url}"
+        snippet = "Use fetch to retrieve crawl, index, and rich result signals."
+        metadata = {"siteUrl": site_for_page, "pageUrl": page_url}
         try:
             inspection = _get_url_inspection_data(site_for_page, page_url, service=service)
             index_status = inspection.get("indexStatus", {})
@@ -942,6 +1025,8 @@ async def connector_search(query: str) -> Dict[str, Any]:
             summary_bits = [bit for bit in [verdict, coverage] if bit]
             if summary_bits:
                 title += " – " + " / ".join(summary_bits)
+                snippet = " | ".join(summary_bits)
+            metadata["indexStatus"] = inspection.get("indexStatus")
         except Exception:
             pass
 
@@ -951,11 +1036,13 @@ async def connector_search(query: str) -> Dict[str, Any]:
             "pageUrl": page_url,
         }
         results.append(
-            {
-                "id": _encode_result_id(payload),
-                "title": title,
-                "url": _console_url(site_for_page, "inspections"),
-            }
+            _build_connector_result(
+                payload,
+                title=title,
+                url=_console_url(site_for_page, "inspections"),
+                snippet=snippet,
+                metadata=metadata,
+            )
         )
         return {"results": results}
 
@@ -986,17 +1073,30 @@ async def connector_search(query: str) -> Dict[str, Any]:
         "endDate": analytics_data.get("endDate"),
         "startRow": analytics_data.get("startRow", 0),
     }
-
+    summary_title = _summarize_search_analytics_title(
+        analytics_data,
+        site_label=site_label,
+        dimension_label=dimension_label or "overall",
+    )
+    total_rows = len(analytics_data.get("rows", []))
+    snippet = (
+        f"{dimension_label.title()} performance across {total_rows} rows "
+        f"({analytics_data.get('startDate')} → {analytics_data.get('endDate')}) "
+        f"for {search_type} search results."
+    )
     results.append(
-        {
-            "id": _encode_result_id(overview_payload),
-            "title": _summarize_search_analytics_title(
-                analytics_data,
-                site_label=site_label,
-                dimension_label=dimension_label or "overall",
-            ),
-            "url": _console_url(site_url, "performance"),
-        }
+        _build_connector_result(
+            overview_payload,
+            title=summary_title,
+            url=_console_url(site_url, "performance"),
+            snippet=snippet,
+            metadata={
+                "siteUrl": site_url,
+                "dimensions": dimensions,
+                "rowCount": total_rows,
+                "searchType": search_type,
+            },
+        )
     )
 
     rows = analytics_data.get("rows", [])
@@ -1004,7 +1104,10 @@ async def connector_search(query: str) -> Dict[str, Any]:
         keys = row.get("keys", [])
         filters = _build_filters_for_keys(dimensions, keys)
         key_label = " / ".join(keys) if keys else "All"
-        metrics_summary = f"{row.get('clicks', 0)} clicks, {row.get('impressions', 0)} impressions"
+        metrics_summary = (
+            f"{row.get('clicks', 0)} clicks, {row.get('impressions', 0)} impressions, "
+            f"{row.get('ctr', 0) * 100:.2f}% CTR"
+        )
         payload = {
             "type": "search_analytics_row",
             "siteUrl": site_url,
@@ -1017,12 +1120,20 @@ async def connector_search(query: str) -> Dict[str, Any]:
             "endDate": analytics_data.get("endDate"),
             "filters": filters,
         }
+        snippet = f"{metrics_summary} (avg pos {row.get('position', 0):.1f})."
         results.append(
-            {
-                "id": _encode_result_id(payload),
-                "title": f"{dimension_label.title()} {key_label} – {metrics_summary} (last {days} days)",
-                "url": _console_url(site_url, "performance"),
-            }
+            _build_connector_result(
+                payload,
+                title=f"{dimension_label.title()} {key_label} (last {days} days)",
+                url=_console_url(site_url, "performance"),
+                snippet=snippet,
+                metadata={
+                    "siteUrl": site_url,
+                    "dimensions": dimensions,
+                    "keys": keys,
+                    "metrics": row,
+                },
+            )
         )
 
     return {"results": results}
@@ -1149,7 +1260,8 @@ async def connector_fetch(document_id: str) -> Dict[str, Any]:
     return {
         "id": document_id,
         "title": title,
-        "text": text,
+        "content": text,
+        "mimeType": "text/markdown",
         "url": url,
         "metadata": metadata,
     }
@@ -1180,3 +1292,6 @@ Amin has created several popular SEO tools including:
 - Google AI Overview Impact Analysis (1.2K+ users)
 - Google AI Overview Citation Analysis (900+ users)
 - SEMRush Enhancer (570+ users)
+"""
+
+    return creator_info.strip()

@@ -37,3 +37,14 @@ python gsc_server.py
 
 The server provides the following tools:
 - `list_properties`: Lists all Search Console properties accessible to the service account 
+
+## ChatGPT Connector Compatibility
+
+This MCP implements the standard `search` and `fetch` surfaces required by [OpenAI's connector specification](https://platform.openai.com/docs/assistants/tools/mcp#connectors). The `search` tool returns enriched metadata (title, snippet, URL, timestamp, score, and connector-specific payload) so that ChatGPT can present actionable cards for properties, sitemap files, URL inspections, and Search Analytics snapshots. The `fetch` tool resolves the opaque `id` values returned by `search` into full Markdown documents along with a `mimeType` and structured metadata that the connector runtime caches.
+
+When you register the server as a connector within ChatGPT, ensure that:
+1. The MCP server is reachable from the connector runtime (usually via `mcp-gsc` script or `python mcp-gsc/gsc_server.py`).
+2. Required Google Search Console credentials are configured through environment variables or the local credential files described above.
+3. The connector manifest references the `search` and `fetch` tool names exposed by this server.
+
+This setup lets ChatGPT issue autonomous queries (e.g., "top queries last 14 days" or "check sitemap errors") and fetch the supporting detail on demand without manual prompt engineering.
