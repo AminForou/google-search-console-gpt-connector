@@ -72,6 +72,7 @@ OAUTH_CODE_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_CODE_TTL", "300"))
 OAUTH_ACCESS_TOKEN_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_ACCESS_TOKEN_TTL", "3600"))
 OAUTH_REFRESH_TOKEN_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_REFRESH_TOKEN_TTL", str(7 * 24 * 3600)))
 OAUTH_SCOPES = os.environ.get("MCP_OAUTH_SCOPES", "gsc.readonly").split()
+CLIENT_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_CLIENT_TTL", str(30 * 24 * 3600)))
 
 
 @dataclass
@@ -114,9 +115,23 @@ class TokenRecord:
         return time.time() > self.refresh_expires_at
 
 
+@dataclass
+class ClientRecord:
+    client_id: str
+    redirect_uris: List[str]
+    client_name: Optional[str]
+    scope: str
+    issued_at: float
+
+    @property
+    def is_expired(self) -> bool:
+        return time.time() > self.issued_at + CLIENT_TTL_SECONDS
+
+
 AUTH_CODES: Dict[str, AuthCodeRecord] = {}
 ACCESS_TOKENS: Dict[str, TokenRecord] = {}
 REFRESH_TOKENS: Dict[str, TokenRecord] = {}
+CLIENT_REGISTRATIONS: Dict[str, "ClientRecord"] = {}
 
 
 def _now() -> float:
@@ -141,6 +156,14 @@ def _cleanup_expired_tokens() -> None:
     ]
     for refresh in expired_refresh:
         REFRESH_TOKENS.pop(refresh, None)
+
+    expired_clients = [
+        client_id
+        for client_id, record in CLIENT_REGISTRATIONS.items()
+        if record.is_expired
+    ]
+    for client_id in expired_clients:
+        CLIENT_REGISTRATIONS.pop(client_id, None)
 
 
 def _pkce_hash(verifier: str) -> str:
@@ -1635,6 +1658,7 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
                 "issuer": base,
                 "authorization_endpoint": f"{base}/oauth/authorize",
                 "token_endpoint": f"{base}/oauth/token",
+                "registration_endpoint": f"{base}/oauth/register",
                 "scopes_supported": OAUTH_SCOPES,
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -1646,6 +1670,7 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
     async def oauth_authorize(request: StarletteRequest) -> Response:
         _cleanup_expired_tokens()
         params = dict(request.query_params)
+        client = None
         if request.method == "GET":
             client_id = params.get("client_id")
             redirect_uri = params.get("redirect_uri")
@@ -1655,6 +1680,11 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
 
             if not client_id or not redirect_uri:
                 return _oauth_error("invalid_request", "Missing client_id or redirect_uri")
+            client = CLIENT_REGISTRATIONS.get(client_id)
+            if client is None:
+                return _oauth_error("unauthorized_client", "Client is not registered.")
+            if redirect_uri not in client.redirect_uris:
+                return _oauth_error("invalid_request", "redirect_uri is not registered for this client.")
             if response_type != "code":
                 return _oauth_error("unsupported_response_type", "Only response_type=code is supported")
 
@@ -1675,6 +1705,11 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
 
         if not client_id or not redirect_uri:
             return _oauth_error("invalid_request", "Missing client_id or redirect_uri")
+        client = CLIENT_REGISTRATIONS.get(client_id)
+        if client is None:
+            return _oauth_error("unauthorized_client", "Client is not registered.")
+        if redirect_uri not in client.redirect_uris:
+            return _oauth_error("invalid_request", "redirect_uri is not registered for this client.")
 
         auth_code = _generate_token(24)
         AUTH_CODES[auth_code] = AuthCodeRecord(
@@ -1783,6 +1818,39 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
 
         return _oauth_error("unsupported_grant_type", "Only authorization_code and refresh_token are supported.")
 
+    async def oauth_register(request: StarletteRequest) -> JSONResponse:
+        _cleanup_expired_tokens()
+        payload = await request.json()
+
+        redirect_uris = payload.get("redirect_uris")
+        if not redirect_uris or not isinstance(redirect_uris, list):
+            return _oauth_error("invalid_client_metadata", "redirect_uris must be provided as a list.")
+
+        client_name = payload.get("client_name")
+        scope = payload.get("scope", " ".join(OAUTH_SCOPES))
+
+        client_id = _generate_token(20)
+        CLIENT_REGISTRATIONS[client_id] = ClientRecord(
+            client_id=client_id,
+            redirect_uris=redirect_uris,
+            client_name=client_name,
+            scope=scope,
+            issued_at=_now(),
+        )
+
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "client_id_issued_at": int(CLIENT_REGISTRATIONS[client_id].issued_at),
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "redirect_uris": redirect_uris,
+                "scope": scope,
+            },
+            status_code=201,
+        )
+
     async def handle_sse(request: StarletteRequest) -> Response:
         _cleanup_expired_tokens()
         token = _token_from_headers(request.headers)
@@ -1805,6 +1873,7 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
         Route("/", landing, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+        Route("/oauth/register", oauth_register, methods=["POST"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Route("/sse", handle_sse, methods=["GET"]),

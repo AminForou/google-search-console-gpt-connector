@@ -68,6 +68,7 @@ This setup lets ChatGPT issue autonomous queries (e.g., "top queries last 14 day
 The deployed service now exposes a complete OAuth 2.0 authorization-code flow (with PKCE):
 
 - `/.well-known/oauth-authorization-server` – discovery metadata
+- `/oauth/register` – RFC 7591 Dynamic Client Registration endpoint
 - `/oauth/authorize` – lightweight approval screen rendered in the browser
 - `/oauth/token` – exchange/refresh endpoint
 - `/sse` and `/messages/` – token-protected MCP SSE transport
