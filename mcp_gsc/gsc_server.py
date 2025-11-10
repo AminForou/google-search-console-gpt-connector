@@ -646,32 +646,6 @@ def get_gsc_service() -> Any:
     last_error: Exception | None = oauth_error
 
     for cred_path in POSSIBLE_CREDENTIAL_PATHS:
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
-        if cred_path and os.path.exists(cred_path):
-            try:
-                creds = service_account.Credentials.from_service_account_file(
-                    cred_path, scopes=SCOPES
-                )
-                return build("searchconsole", "v1", credentials=creds)
-            except Exception as e:
-                continue  # Try the next path if this one fails
-    
-    # If we get here, none of the authentication methods worked
-    raise FileNotFoundError(
-        "No valid Google Search Console credentials found. "
-        "Provide a service account JSON via GSC_CREDENTIALS_PATH or place it next to gsc_server.py, "
-        "or configure OAuth credentials."
-    )
-
-
-def get_gsc_service_oauth():
-    """Authenticate via OAuth user credentials."""
-
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-
-=======
         if not cred_path or not os.path.exists(cred_path):
             continue
 
@@ -679,11 +653,9 @@ def get_gsc_service_oauth():
             creds = service_account.Credentials.from_service_account_file(
                 cred_path, scopes=SCOPES
             )
-        except Exception as exc:  # pragma: no cover - depends on environment
+            return build("searchconsole", "v1", credentials=creds)
+        except Exception as exc:  # pragma: no cover - environment specific
             last_error = exc
-            continue
-
-        return build("searchconsole", "v1", credentials=creds)
 
     if last_error is not None:
         raise RuntimeError(
@@ -692,42 +664,30 @@ def get_gsc_service_oauth():
         ) from last_error
 
     raise FileNotFoundError(
-        "Google Search Console credentials were not found. "
-        "Set GSC_OAUTH_CLIENT_SECRETS_FILE, provide a token.json file, "
-        "or place service_account_credentials.json alongside the server."
+        "No valid Google Search Console credentials found. "
+        "Set GSC_CREDENTIALS_PATH or place service_account_credentials.json next to gsc_server.py, "
+        "or configure OAuth credentials."
     )
 
 
 def get_gsc_service_oauth() -> Any:
-    """Authenticate the user via OAuth and return a Search Console service."""
+    """Authenticate via OAuth user credentials."""
 
     creds: Credentials | None = None
-
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
                 raise FileNotFoundError(
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
                     "OAuth client secrets file not found. Provide client_secrets.json or set "
                     "GSC_OAUTH_CLIENT_SECRETS_FILE."
-                )
-
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(TOKEN_FILE, "w") as token:
-=======
-                    "OAuth client secrets file not found. Place a client_secrets.json "
-                    "file next to the server or set GSC_OAUTH_CLIENT_SECRETS_FILE."
                 )
 
             flow = InstalledAppFlow.from_client_secrets_file(
@@ -736,7 +696,6 @@ def get_gsc_service_oauth() -> Any:
             creds = flow.run_local_server(port=0)
 
         with open(TOKEN_FILE, "w", encoding="utf-8") as token:
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
             token.write(creds.to_json())
 
     return build("searchconsole", "v1", credentials=creds)
@@ -774,21 +733,16 @@ async def list_properties() -> str:
 
 @mcp.tool()
 async def delete_site(site_url: str) -> str:
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
     """
     Remove a Search Console property that the authenticated identity has access to.
     """
-=======
-    """Remove a property from Google Search Console."""
 
     if not site_url:
         return "A site_url parameter is required."
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
 
     try:
         service = get_gsc_service()
         service.sites().delete(siteUrl=site_url).execute()
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
         return f"Successfully removed {site_url}."
     except HttpError as error:
         error_code = getattr(error.resp, "status", None)
@@ -811,31 +765,6 @@ async def delete_site(site_url: str) -> str:
 
         return f"Error removing site (HTTP {error_code}): {error_message}"
     except Exception as exc:
-=======
-        return (
-            "Site removal requested. Google may take a few minutes to "
-            "process the deletion."
-        )
-    except HttpError as exc:
-        error_code = getattr(exc, "status_code", None)
-        error_message = getattr(exc, "reason", str(exc))
-        if error_code == 403:
-            return (
-                "Error: The authenticated user does not have permission to "
-                "remove this property."
-            )
-        if error_code == 401:
-            return "Error: Unauthorized. Please verify your credentials."
-        if error_code == 429:
-            return "Error: Too many requests. Please try again later."
-        if error_code in {500, 503}:
-            return (
-                "Error: Google Search Console service is currently "
-                "unavailable. Please try again later."
-            )
-        return f"Error removing site (HTTP {error_code}): {error_message}"
-    except Exception as exc:  # pragma: no cover - defensive catch
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
         return f"Error removing site: {exc}"
 
 @mcp.tool()
@@ -878,7 +807,6 @@ async def get_site_details(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
         site_info = service.sites().get(siteUrl=site_url).execute()
 
         lines = [f"Site details for {site_url}", "-" * 50]
@@ -887,76 +815,33 @@ async def get_site_details(site_url: str) -> str:
         verification = site_info.get("siteVerificationInfo") or {}
         if verification:
             lines.append("Verification:")
-            if verification.get("verificationState"):
-                lines.append(f"- State: {verification['verificationState']}")
-            if verification.get("verifiedUser"):
-                lines.append(f"- Verified user: {verification['verifiedUser']}")
-            if verification.get("verificationMethod"):
-                lines.append(f"- Method: {verification['verificationMethod']}")
+            state = verification.get("verificationState")
+            if state:
+                lines.append(f"- State: {state}")
+            verified_user = verification.get("verifiedUser")
+            if verified_user:
+                lines.append(f"- Verified user: {verified_user}")
+            method = verification.get("verificationMethod")
+            if method:
+                lines.append(f"- Method: {method}")
 
         ownership = site_info.get("ownershipInfo") or {}
         if ownership:
             lines.append("Ownership:")
-            if ownership.get("owner"):
-                lines.append(f"- Owner: {ownership['owner']}")
-            if ownership.get("verificationMethod"):
-                lines.append(f"- Verification: {ownership['verificationMethod']}")
+            owner_name = ownership.get("owner") or ownership.get("email") or "Unknown"
+            lines.append(f"- Owner: {owner_name}")
+            method = ownership.get("verificationMethod")
+            if method:
+                lines.append(f"- Verification: {method}")
 
         return "\n".join(lines)
-    except Exception as exc:
-=======
-
-        # Get site details
-        site_info = service.sites().get(siteUrl=site_url).execute()
-
-        # Format the results
-        result_lines = [f"Site details for {site_url}:"]
-        result_lines.append("-" * 50)
-
-        # Add basic info
-        result_lines.append(f"Permission level: {site_info.get('permissionLevel', 'Unknown')}")
-
-        # Add verification info if available
-        verification_info = site_info.get("siteVerificationInfo")
-        if verification_info:
-            result_lines.append("")
-            result_lines.append("Verification information:")
-            entries = (
-                verification_info
-                if isinstance(verification_info, list)
-                else [verification_info]
-            )
-            for entry in entries:
-                owner = entry.get("owner") or entry.get("verifiedOwner")
-                if owner:
-                    result_lines.append(f"Owner: {owner}")
-                method = entry.get("verificationMethod")
-                if method:
-                    result_lines.append(f"Verification method: {method}")
-                state = entry.get("verificationState")
-                if state:
-                    result_lines.append(f"Verification state: {state}")
-
-        # Add ownership info if available
-        ownership_info = site_info.get("ownershipInfo")
-        if ownership_info:
-            result_lines.append("")
-            result_lines.append("Ownership information:")
-            owners = ownership_info if isinstance(ownership_info, list) else [ownership_info]
-            for idx, owner in enumerate(owners, start=1):
-                prefix = f"Owner {idx}:" if len(owners) > 1 else "Owner:"
-                owner_name = owner.get("owner") or owner.get("email") or "Unknown"
-                result_lines.append(f"{prefix} {owner_name}")
-                verification = owner.get("verificationMethod")
-                if verification:
-                    result_lines.append(f"Verification: {verification}")
-
-        return "\n".join(result_lines)
     except HttpError as exc:
-        error_message = getattr(exc, "reason", str(exc))
-        return f"Error retrieving site details (HTTP {getattr(exc, 'status_code', 'unknown')}): {error_message}"
-    except Exception as exc:  # pragma: no cover - defensive catch
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
+        status = getattr(getattr(exc, "resp", None), "status", None) or getattr(
+            exc, "status_code", "unknown"
+        )
+        reason = getattr(exc, "_get_reason", lambda: getattr(exc, "reason", str(exc)))()
+        return f"Error retrieving site details (HTTP {status}): {reason}"
+    except Exception as exc:
         return f"Error retrieving site details: {exc}"
 
 @mcp.tool()
@@ -1014,7 +899,6 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
 
         if len(url_list) > 10:
             return (
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
                 f"Too many URLs provided ({len(url_list)}). "
                 "Please limit to 10 URLs per batch to avoid API quota issues."
             )
@@ -1035,30 +919,6 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
         return "\n\n".join(summaries)
 
     except Exception as exc:
-        return f"Error inspecting URLs: {exc}"
-=======
-                f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch "
-                "to avoid API quota issues."
-            )
-
-        lines = [f"Batch inspection for {site_url}", "-" * 50]
-
-        for page_url in url_list:
-            lines.append("")
-            lines.append(f"URL: {page_url}")
-            try:
-                data = _get_url_inspection_data(site_url, page_url, service=service)
-                lines.append(_format_url_inspection_text(data))
-            except HttpError as exc:
-                lines.append(
-                    f"Error inspecting URL (HTTP {getattr(exc, 'status_code', 'unknown')}): "
-                    f"{getattr(exc, 'reason', str(exc))}"
-                )
-            except Exception as exc:  # pragma: no cover - defensive catch
-                lines.append(f"Unexpected error inspecting URL: {exc}")
-
-        return "\n".join(lines)
-    except Exception as exc:  # pragma: no cover - defensive catch
         return f"Error inspecting URLs: {exc}"
 
 
@@ -1112,7 +972,6 @@ async def manage_sitemaps(
         )
     except Exception as exc:  # pragma: no cover - defensive catch
         return f"Error managing sitemaps: {exc}"
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
 
 @mcp.tool(name="search")
 async def connector_search(query: str) -> Dict[str, Any]:
@@ -1511,8 +1370,4 @@ Amin Foroutan is an SEO consultant with over a decade of experience, specializin
 - SEMRush Enhancer (570+ users)
 """
 
-<<<<<<< HEAD:mcp-gsc/gsc_server.py
     return creator_info.strip()
-=======
-    return creator_info
->>>>>>> 51e85885d9f5b4d5e05b7c0a531a0f5cb7112f5e:mcp_gsc/gsc_server.py
