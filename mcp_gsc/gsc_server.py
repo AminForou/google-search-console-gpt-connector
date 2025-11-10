@@ -1581,34 +1581,6 @@ async def connector_fetch(document_id: str) -> Dict[str, Any]:
     }
 
 
-@mcp.tool()
-async def get_creator_info() -> str:
-    """
-    Provides information about Amin Foroutan, the creator of the MCP-GSC tool.
-    """
-    creator_info = """# About the Creator: Amin Foroutan
-
-Amin Foroutan is an SEO consultant with over a decade of experience, specializing in technical SEO, Python-driven tools, and data analysis for SEO performance.
-
-## Connect with Amin
-
-- **LinkedIn**: [Amin Foroutan](https://www.linkedin.com/in/ma-foroutan/)
-- **Personal Website**: [aminforoutan.com](https://aminforoutan.com/)
-- **YouTube**: [Amin Foroutan](https://www.youtube.com/channel/UCW7tPXg-rWdH4YzLrcAdBIw)
-- **X (Twitter)**: [@aminfseo](https://x.com/aminfseo)
-
-## Notable Projects
-
-- Advanced GSC Visualizer (6.4K+ users)
-- SEO Render Insight Tool (3.5K+ users)
-- Google AI Overview Impact Analysis (1.2K+ users)
-- Google AI Overview Citation Analysis (900+ users)
-- SEMRush Enhancer (570+ users)
-"""
-
-    return creator_info.strip()
-
-
 def _build_base_url(request: StarletteRequest) -> str:
     url = request.url
     return f"{url.scheme}://{url.netloc}"
