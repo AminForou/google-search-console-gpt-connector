@@ -1,10 +1,16 @@
 from typing import Any, Dict, List, Optional, Sequence
+import asyncio
 import base64
 import os
 import json
 import re
+import secrets
+import hashlib
+import time
+import textwrap
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from dataclasses import dataclass
+from urllib.parse import quote, urlencode
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -16,6 +22,20 @@ from googleapiclient.errors import HttpError
 
 # MCP
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import SseServerTransport
+
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Mount, Route
+from starlette.datastructures import Headers, URL
 
 mcp = FastMCP("gsc-server")
 
@@ -48,6 +68,199 @@ MAX_SEARCH_ANALYTICS_ROWS = 25000
 DEFAULT_SEARCH_ANALYTICS_ROWS = 20
 URL_IN_QUERY_PATTERN = re.compile(r"https?://[^\s>]+", re.IGNORECASE)
 
+OAUTH_CODE_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_CODE_TTL", "300"))
+OAUTH_ACCESS_TOKEN_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_ACCESS_TOKEN_TTL", "3600"))
+OAUTH_REFRESH_TOKEN_TTL_SECONDS = int(os.environ.get("MCP_OAUTH_REFRESH_TOKEN_TTL", str(7 * 24 * 3600)))
+OAUTH_SCOPES = os.environ.get("MCP_OAUTH_SCOPES", "gsc.readonly").split()
+
+
+@dataclass
+class AuthCodeRecord:
+    client_id: str
+    redirect_uri: str
+    scope: str
+    code_challenge: Optional[str]
+    code_challenge_method: Optional[str]
+    state: Optional[str]
+    issued_at: float
+
+    @property
+    def is_expired(self) -> bool:
+        return time.time() > self.issued_at + OAUTH_CODE_TTL_SECONDS
+
+
+@dataclass
+class TokenRecord:
+    access_token: str
+    refresh_token: str
+    scope: str
+    client_id: str
+    issued_at: float
+
+    @property
+    def expires_at(self) -> float:
+        return self.issued_at + OAUTH_ACCESS_TOKEN_TTL_SECONDS
+
+    @property
+    def is_expired(self) -> bool:
+        return time.time() > self.expires_at
+
+    @property
+    def refresh_expires_at(self) -> float:
+        return self.issued_at + OAUTH_REFRESH_TOKEN_TTL_SECONDS
+
+    @property
+    def refresh_expired(self) -> bool:
+        return time.time() > self.refresh_expires_at
+
+
+AUTH_CODES: Dict[str, AuthCodeRecord] = {}
+ACCESS_TOKENS: Dict[str, TokenRecord] = {}
+REFRESH_TOKENS: Dict[str, TokenRecord] = {}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _generate_token(length: int = 32) -> str:
+    return secrets.token_urlsafe(length)
+
+
+def _cleanup_expired_tokens() -> None:
+    expired_access = [token for token, record in ACCESS_TOKENS.items() if record.is_expired]
+    for token in expired_access:
+        ACCESS_TOKENS.pop(token, None)
+
+    expired_codes = [code for code, record in AUTH_CODES.items() if record.is_expired]
+    for code in expired_codes:
+        AUTH_CODES.pop(code, None)
+
+    expired_refresh = [
+        refresh for refresh, record in REFRESH_TOKENS.items() if record.refresh_expired
+    ]
+    for refresh in expired_refresh:
+        REFRESH_TOKENS.pop(refresh, None)
+
+
+def _pkce_hash(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+
+def _token_from_headers(headers: Headers | Dict[str, str]) -> Optional[TokenRecord]:
+    if isinstance(headers, dict):
+        auth_header = headers.get("authorization") or headers.get("Authorization")
+    else:
+        auth_header = headers.get("authorization")
+
+    if not auth_header:
+        return None
+
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    token = parts[1].strip()
+    record = ACCESS_TOKENS.get(token)
+    if not record:
+        return None
+
+    if record.is_expired:
+        ACCESS_TOKENS.pop(token, None)
+        REFRESH_TOKENS.pop(record.refresh_token, None)
+        return None
+
+    return record
+
+
+def _oauth_error(error: str, description: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {"error": error, "error_description": description},
+        status_code=status_code,
+    )
+
+
+def _render_authorize_page(
+    client_id: str,
+    redirect_uri: str,
+    scope: str,
+    state: Optional[str],
+) -> str:
+    scope_list = ", ".join(scope.split())
+    instructions = textwrap.dedent(
+        """
+        <p>This connector gives ChatGPT read-only access to your Google Search Console data
+        through a service account or OAuth user credentials already configured on the server.</p>
+        <p>By approving, you allow ChatGPT to issue Search Console queries on your behalf.
+        Make sure you have shared the relevant properties with the service account email that belongs to this deployment.</p>
+        """
+    ).strip()
+
+    hidden_state = (
+        f'<input type="hidden" name="state" value="{state}"/>'
+        if state is not None
+        else ""
+    )
+
+    return f"""
+    <html>
+        <head>
+            <title>Authorize ChatGPT Connector</title>
+            <style>
+                body {{
+                    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+                    margin: 2rem auto;
+                    max-width: 720px;
+                    line-height: 1.5;
+                    color: #1f2933;
+                }}
+                header {{
+                    margin-bottom: 1.5rem;
+                }}
+                .card {{
+                    border: 1px solid #d1d5db;
+                    border-radius: 12px;
+                    padding: 1.5rem;
+                    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1);
+                }}
+                button {{
+                    background: #0f172a;
+                    color: white;
+                    border: none;
+                    padding: 0.75rem 1.5rem;
+                    border-radius: 999px;
+                    cursor: pointer;
+                    font-size: 1rem;
+                }}
+                button:hover {{
+                    background: #111827;
+                }}
+            </style>
+        </head>
+        <body>
+            <header>
+                <h1>Google Search Console Connector</h1>
+                <p>Client ID: <code>{client_id}</code></p>
+            </header>
+            <div class="card">
+                <h2>Scope requested</h2>
+                <p>{scope_list}</p>
+                {instructions}
+                <form method="post">
+                    <input type="hidden" name="client_id" value="{client_id}"/>
+                    <input type="hidden" name="redirect_uri" value="{redirect_uri}"/>
+                    <input type="hidden" name="scope" value="{scope}"/>
+                    {hidden_state}
+                    <input type="hidden" name="decision" value="approve"/>
+                    <p style="margin-top:1.5rem;">
+                        <button type="submit">Allow access</button>
+                    </p>
+                </form>
+            </div>
+        </body>
+    </html>
+    """
 
 def _current_timestamp() -> str:
     """Return a UTC timestamp formatted for connector payloads."""
@@ -1371,3 +1584,244 @@ Amin Foroutan is an SEO consultant with over a decade of experience, specializin
 """
 
     return creator_info.strip()
+
+
+def _build_base_url(request: StarletteRequest) -> str:
+    url = request.url
+    return f"{url.scheme}://{url.netloc}"
+
+
+def _token_error_response(detail: str, status_code: int = 401) -> PlainTextResponse:
+    return PlainTextResponse(detail, status_code=status_code)
+
+
+def _protect_asgi_app(app):
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http":
+            headers = Headers(scope=scope)
+            if _token_from_headers(headers) is None:
+                response = _token_error_response("Unauthorized")
+                await response(scope, receive, send)
+                return
+        await app(scope, receive, send)
+
+    return wrapped
+
+
+def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
+    """Create a Starlette application that wraps the SSE transport with OAuth."""
+
+    sse = SseServerTransport("/messages/")
+
+    async def landing(_: StarletteRequest) -> JSONResponse:
+        _cleanup_expired_tokens()
+        return JSONResponse(
+            {
+                "status": "ok",
+                "server": mcp_app.name,
+                "requires_oauth": True,
+                "documentation": "Share your Search Console property with the configured service account.",
+            }
+        )
+
+    async def health(_: StarletteRequest) -> PlainTextResponse:
+        _cleanup_expired_tokens()
+        return PlainTextResponse("ok")
+
+    async def oauth_metadata(request: StarletteRequest) -> JSONResponse:
+        base = _build_base_url(request)
+        return JSONResponse(
+            {
+                "issuer": base,
+                "authorization_endpoint": f"{base}/oauth/authorize",
+                "token_endpoint": f"{base}/oauth/token",
+                "scopes_supported": OAUTH_SCOPES,
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256", "plain"],
+                "token_endpoint_auth_methods_supported": ["none"],
+            }
+        )
+
+    async def oauth_authorize(request: StarletteRequest) -> Response:
+        _cleanup_expired_tokens()
+        params = dict(request.query_params)
+        if request.method == "GET":
+            client_id = params.get("client_id")
+            redirect_uri = params.get("redirect_uri")
+            response_type = params.get("response_type", "code")
+            scope = params.get("scope", " ".join(OAUTH_SCOPES))
+            state = params.get("state")
+
+            if not client_id or not redirect_uri:
+                return _oauth_error("invalid_request", "Missing client_id or redirect_uri")
+            if response_type != "code":
+                return _oauth_error("unsupported_response_type", "Only response_type=code is supported")
+
+            html = _render_authorize_page(client_id, redirect_uri, scope, state)
+            return HTMLResponse(html)
+
+        form = await request.form()
+        decision = form.get("decision")
+        if decision != "approve":
+            return _oauth_error("access_denied", "The request was denied by the user.")
+
+        client_id = form.get("client_id")
+        redirect_uri = form.get("redirect_uri")
+        scope = form.get("scope", " ".join(OAUTH_SCOPES))
+        state = form.get("state")
+        code_challenge = request.query_params.get("code_challenge")
+        code_challenge_method = request.query_params.get("code_challenge_method")
+
+        if not client_id or not redirect_uri:
+            return _oauth_error("invalid_request", "Missing client_id or redirect_uri")
+
+        auth_code = _generate_token(24)
+        AUTH_CODES[auth_code] = AuthCodeRecord(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scope=scope,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            state=state,
+            issued_at=_now(),
+        )
+
+        redirect_url = URL(redirect_uri).include_query_params(code=auth_code)
+        if state:
+            redirect_url = redirect_url.include_query_params(state=state)
+
+        return RedirectResponse(str(redirect_url), status_code=302)
+
+    async def oauth_token(request: StarletteRequest) -> JSONResponse:
+        _cleanup_expired_tokens()
+        content_type = request.headers.get("content-type", "")
+
+        if "application/json" in content_type:
+            payload = await request.json()
+        else:
+            form = await request.form()
+            payload = dict(form)
+
+        grant_type = payload.get("grant_type")
+        if grant_type == "authorization_code":
+            code = payload.get("code")
+            if not code:
+                return _oauth_error("invalid_request", "Missing authorization code.")
+
+            record = AUTH_CODES.pop(code, None)
+            if not record or record.is_expired:
+                return _oauth_error("invalid_grant", "Authorization code is invalid or expired.")
+
+            verifier = payload.get("code_verifier")
+            if record.code_challenge:
+                if not verifier:
+                    return _oauth_error("invalid_request", "Missing code_verifier for PKCE.")
+                method = (record.code_challenge_method or "plain").upper()
+                if method == "S256":
+                    if _pkce_hash(verifier) != record.code_challenge:
+                        return _oauth_error("invalid_grant", "PKCE verification failed.")
+                else:
+                    if verifier != record.code_challenge:
+                        return _oauth_error("invalid_grant", "PKCE verification failed.")
+
+            access_token = _generate_token(32)
+            refresh_token = _generate_token(40)
+            token_record = TokenRecord(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                scope=record.scope,
+                client_id=record.client_id,
+                issued_at=_now(),
+            )
+            ACCESS_TOKENS[access_token] = token_record
+            REFRESH_TOKENS[refresh_token] = token_record
+
+            return JSONResponse(
+                {
+                    "token_type": "Bearer",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_in": OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+                    "scope": record.scope,
+                }
+            )
+
+        if grant_type == "refresh_token":
+            refresh_token = payload.get("refresh_token")
+            if not refresh_token:
+                return _oauth_error("invalid_request", "Missing refresh_token.")
+
+            record = REFRESH_TOKENS.get(refresh_token)
+            if not record:
+                return _oauth_error("invalid_grant", "Unknown refresh token.")
+
+            for token, info in list(ACCESS_TOKENS.items()):
+                if info.refresh_token == refresh_token:
+                    ACCESS_TOKENS.pop(token, None)
+
+            new_access = _generate_token(32)
+            new_record = TokenRecord(
+                access_token=new_access,
+                refresh_token=refresh_token,
+                scope=record.scope,
+                client_id=record.client_id,
+                issued_at=_now(),
+            )
+            ACCESS_TOKENS[new_access] = new_record
+            REFRESH_TOKENS[refresh_token] = new_record
+
+            return JSONResponse(
+                {
+                    "token_type": "Bearer",
+                    "access_token": new_access,
+                    "refresh_token": refresh_token,
+                    "expires_in": OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+                    "scope": record.scope,
+                }
+            )
+
+        return _oauth_error("unsupported_grant_type", "Only authorization_code and refresh_token are supported.")
+
+    async def handle_sse(request: StarletteRequest) -> Response:
+        _cleanup_expired_tokens()
+        token = _token_from_headers(request.headers)
+        if token is None:
+            return _token_error_response("Unauthorized")
+
+        async with sse.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,
+        ) as streams:
+            await mcp_app._mcp_server.run(  # type: ignore[attr-defined]
+                streams[0],
+                streams[1],
+                mcp_app._mcp_server.create_initialization_options(),  # type: ignore[attr-defined]
+            )
+        return Response(status_code=204)
+
+    routes = [
+        Route("/", landing, methods=["GET"]),
+        Route("/healthz", health, methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+        Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
+        Route("/oauth/token", oauth_token, methods=["POST"]),
+        Route("/sse", handle_sse, methods=["GET"]),
+        Mount("/messages/", app=_protect_asgi_app(sse.handle_post_message)),
+    ]
+
+    return Starlette(debug=mcp_app.settings.debug, routes=routes)
+
+
+def run_oauth_server(host: Optional[str] = None, port: Optional[int] = None) -> None:
+    """Run the Starlette SSE server with OAuth endpoints."""
+
+    app = create_oauth_starlette_app(mcp)
+    server_host = host or os.environ.get("MCP_SERVER_HOST") or os.environ.get("FASTMCP_HOST") or "0.0.0.0"
+    server_port = int(port or os.environ.get("MCP_SERVER_PORT") or os.environ.get("FASTMCP_PORT") or "8000")
+    log_level = os.environ.get("FASTMCP_LOG_LEVEL", "info").lower()
+
+    config = uvicorn.Config(app, host=server_host, port=server_port, log_level=log_level)
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
