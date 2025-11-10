@@ -1581,6 +1581,34 @@ async def connector_fetch(document_id: str) -> Dict[str, Any]:
     }
 
 
+@mcp.tool()
+async def get_creator_info() -> str:
+    """
+    Provides information about Amin Foroutan, the creator of the MCP-GSC tool.
+    """
+    creator_info = """# About the Creator: Amin Foroutan
+
+Amin Foroutan is an SEO consultant with over a decade of experience, specializing in technical SEO, Python-driven tools, and data analysis for SEO performance.
+
+## Connect with Amin
+
+- **LinkedIn**: [Amin Foroutan](https://www.linkedin.com/in/ma-foroutan/)
+- **Personal Website**: [aminforoutan.com](https://aminforoutan.com/)
+- **YouTube**: [Amin Foroutan](https://www.youtube.com/channel/UCW7tPXg-rWdH4YzLrcAdBIw)
+- **X (Twitter)**: [@aminfseo](https://x.com/aminfseo)
+
+## Notable Projects
+
+- Advanced GSC Visualizer (6.4K+ users)
+- SEO Render Insight Tool (3.5K+ users)
+- Google AI Overview Impact Analysis (1.2K+ users)
+- Google AI Overview Citation Analysis (900+ users)
+- SEMRush Enhancer (570+ users)
+"""
+
+    return creator_info.strip()
+
+
 def _build_base_url(request: StarletteRequest) -> str:
     url = request.url
     return f"{url.scheme}://{url.netloc}"
@@ -1636,6 +1664,30 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256", "plain"],
                 "token_endpoint_auth_methods_supported": ["none"],
+            }
+        )
+
+    async def mcp_discovery(request: StarletteRequest) -> JSONResponse:
+        base = _build_base_url(request)
+        return JSONResponse(
+            {
+                "schema": "1.0",
+                "name": mcp_app.name or "google-search-console",
+                "description": (
+                    "Google Search Console MCP server that exposes Search Analytics, "
+                    "URL Inspection, sitemap insights, and property metadata."
+                ),
+                "endpoints": {
+                    "sse": f"{base}/sse",
+                },
+                "oauth": {
+                    "authorization_url": f"{base}/oauth/authorize",
+                    "token_url": f"{base}/oauth/token",
+                    "registration_url": f"{base}/oauth/register",
+                },
+                "metadata": {
+                    "documentation": "https://github.com/aminf/mcp-gsc-gpt",
+                },
             }
         )
 
@@ -1845,6 +1897,7 @@ def create_oauth_starlette_app(mcp_app: FastMCP) -> Starlette:
         Route("/", landing, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+        Route("/.well-known/mcp.json", mcp_discovery, methods=["GET"]),
         Route("/oauth/register", oauth_register, methods=["POST"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),

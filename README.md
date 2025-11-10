@@ -50,6 +50,7 @@ The server exposes several MCP tools, including:
 - `manage_sitemaps`: Submit, remove, or review sitemap information.
 - `connector_search`: Search entry point required by ChatGPT connectors.
 - `connector_fetch`: Fetch entry point required by ChatGPT connectors.
+- `get_creator_info`: Basic information about the tool author.
 
 ## ChatGPT Connector Compatibility
 
